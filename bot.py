@@ -2,13 +2,12 @@ import os
 import re
 import threading
 import requests
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import asyncio
 
 # ── Flask API ─────────────────────────────────────────────────────────────────
 
@@ -16,19 +15,21 @@ app = Flask(__name__)
 CORS(app)
 
 def get_conn():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
 
 @app.route("/tasks", methods=["GET"])
 def get_tasks_api():
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM tasks ORDER BY (status='done'), priority DESC, created_at ASC")
-    tasks = list(cur.fetchall())
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tasks ORDER BY (status='done'), priority DESC, created_at ASC")
+            tasks = cur.fetchall()
+    result = []
     for t in tasks:
+        t = dict(t)
         if t.get("created_at"):
             t["created_at"] = t["created_at"].isoformat()
-    cur.close(); conn.close()
-    return jsonify(tasks)
+        result.append(t)
+    return jsonify(result)
 
 @app.route("/tasks", methods=["POST"])
 def create_task_api():
@@ -38,16 +39,16 @@ def create_task_api():
     priority = int(data.get("priority", 5))
     if not text:
         return jsonify({"error": "text required"}), 400
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        "INSERT INTO tasks (text, status, priority) VALUES (%s, %s, %s) RETURNING *",
-        (text, status, priority)
-    )
-    task = dict(cur.fetchone())
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO tasks (text, status, priority) VALUES (%s, %s, %s) RETURNING *",
+                (text, status, priority)
+            )
+            task = dict(cur.fetchone())
+        conn.commit()
     if task.get("created_at"):
         task["created_at"] = task["created_at"].isoformat()
-    conn.commit(); cur.close(); conn.close()
     return jsonify(task), 201
 
 @app.route("/tasks/<int:task_id>", methods=["PATCH"])
@@ -63,11 +64,11 @@ def update_task_api(task_id):
     if not fields:
         return jsonify({"error": "nothing to update"}), 400
     values.append(task_id)
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = %s RETURNING *", values)
-    row = cur.fetchone()
-    conn.commit(); cur.close(); conn.close()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = %s RETURNING *", values)
+            row = cur.fetchone()
+        conn.commit()
     if not row:
         return jsonify({"error": "not found"}), 404
     task = dict(row)
@@ -77,10 +78,10 @@ def update_task_api(task_id):
 
 @app.route("/tasks/<int:task_id>", methods=["DELETE"])
 def delete_task_api(task_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
-    conn.commit(); cur.close(); conn.close()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
+        conn.commit()
     return jsonify({"ok": True})
 
 @app.route("/", methods=["GET"])
@@ -180,7 +181,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• *Completa revisar el informe*\n"
         "• *Elimina revisar el informe*\n"
         "• *Edita revisar el informe por revisar informe final*\n"
-        "• *Empieza revisar el informe*\n",
+        "• *Empieza revisar el informe* (→ en progreso)\n",
         parse_mode="Markdown"
     )
 
@@ -246,16 +247,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ocurrió un error: {str(e)}")
 
-# ── Bot corre en hilo secundario ──────────────────────────────────────────────
+# ── Bot en hilo secundario ────────────────────────────────────────────────────
 
 def run_bot():
+    import asyncio
     token = os.environ["TELEGRAM_TOKEN"]
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     tg_app = ApplicationBuilder().token(token).build()
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot de Telegram corriendo en hilo secundario...")
+    print("Bot de Telegram corriendo...")
     tg_app.run_polling()
 
 # ── Entry point: Flask en hilo principal ─────────────────────────────────────
@@ -263,141 +265,6 @@ def run_bot():
 if __name__ == "__main__":
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
-
     port = int(os.environ.get("PORT", 5000))
-    print(f"API Flask corriendo en puerto {port}...")
+    print(f"API corriendo en puerto {port}...")
     app.run(host="0.0.0.0", port=port, use_reloader=False)
-    # agregar
-    add_match = re.search(r"(agrega|agregar|añade|añadir|crea|crear|nueva tarea|nuevo)\s+(.+)", t)
-    if add_match:
-        content = add_match.group(2).strip()
-        priority = 5
-        p_match = re.search(r"prioridad\s*(\d+)", content)
-        if p_match:
-            priority = max(1, min(10, int(p_match.group(1))))
-            content = content[:p_match.start()].strip()
-        status = "todo"
-        if "en progreso" in content:
-            status = "doing"; content = content.replace("en progreso", "").strip()
-        return "create", {"text": content, "priority": priority, "status": status}
-
-    # completar / marcar hecho
-    done_match = re.search(r"(completa|completar|marca|marcar|termina|terminar|hecho|done)\s+(.+)", t)
-    if done_match:
-        return "done", {"query": done_match.group(2).strip()}
-
-    # mover a en progreso
-    doing_match = re.search(r"(empieza|empezar|inicia|iniciar|en progreso)\s+(.+)", t)
-    if doing_match:
-        return "doing", {"query": doing_match.group(2).strip()}
-
-    # eliminar
-    del_match = re.search(r"(elimina|eliminar|borra|borrar|quita|quitar|delete)\s+(.+)", t)
-    if del_match:
-        return "delete", {"query": del_match.group(2).strip()}
-
-    # editar texto
-    edit_match = re.search(r"(edita|editar|cambia|cambiar|renombra|renombrar)\s+(.+?)\s+(a|por|como)\s+(.+)", t)
-    if edit_match:
-        return "edit", {"query": edit_match.group(2).strip(), "new_text": edit_match.group(4).strip()}
-
-    # prioridad
-    prio_match = re.search(r"(prioridad|priority)\s+(\d+)\s+(a|para|de)\s+(.+)", t)
-    if prio_match:
-        return "priority", {"priority": int(prio_match.group(2)), "query": prio_match.group(4).strip()}
-
-    return "unknown", {}
-
-# ── handlers ─────────────────────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hola! Soy tu asistente de tareas. Puedes decirme cosas como:\n\n"
-        "• *Agrega revisar el informe con prioridad 8*\n"
-        "• *Muestra mis tareas*\n"
-        "• *Completa revisar el informe*\n"
-        "• *Elimina revisar el informe*\n"
-        "• *Edita revisar el informe por revisar informe final*\n"
-        "• *Empieza revisar el informe* (→ en progreso)\n",
-        parse_mode="Markdown"
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    intent, params = detect_intent(text)
-
-    try:
-        if intent == "list":
-            tasks = get_tasks()
-            await update.message.reply_text(format_tasks(tasks))
-
-        elif intent == "create":
-            task = create_task(params["text"], params["status"], params["priority"])
-            await update.message.reply_text(
-                f"Tarea creada [ID {task['id']}]:\n*{task['text']}* — P{task['priority']}",
-                parse_mode="Markdown"
-            )
-
-        elif intent in ("done", "doing"):
-            tasks = get_tasks()
-            task = find_task_by_words(tasks, params["query"])
-            if not task:
-                await update.message.reply_text(f"No encontré ninguna tarea con '{params['query']}'.")
-                return
-            new_status = "done" if intent == "done" else "doing"
-            update_task(task["id"], status=new_status)
-            label = "completada" if new_status == "done" else "movida a en progreso"
-            await update.message.reply_text(f"Tarea {label}: *{task['text']}*", parse_mode="Markdown")
-
-        elif intent == "delete":
-            tasks = get_tasks()
-            task = find_task_by_words(tasks, params["query"])
-            if not task:
-                await update.message.reply_text(f"No encontré ninguna tarea con '{params['query']}'.")
-                return
-            delete_task(task["id"])
-            await update.message.reply_text(f"Tarea eliminada: *{task['text']}*", parse_mode="Markdown")
-
-        elif intent == "edit":
-            tasks = get_tasks()
-            task = find_task_by_words(tasks, params["query"])
-            if not task:
-                await update.message.reply_text(f"No encontré ninguna tarea con '{params['query']}'.")
-                return
-            update_task(task["id"], text=params["new_text"])
-            await update.message.reply_text(
-                f"Tarea actualizada:\n*{params['new_text']}*", parse_mode="Markdown"
-            )
-
-        elif intent == "priority":
-            tasks = get_tasks()
-            task = find_task_by_words(tasks, params["query"])
-            if not task:
-                await update.message.reply_text(f"No encontré ninguna tarea con '{params['query']}'.")
-                return
-            p = max(1, min(10, params["priority"]))
-            update_task(task["id"], priority=p)
-            await update.message.reply_text(
-                f"Prioridad de *{task['text']}* cambiada a P{p}.", parse_mode="Markdown"
-            )
-
-        else:
-            await update.message.reply_text(
-                "No entendí. Prueba con:\n"
-                "• *Agrega [tarea]* \n• *Muestra mis tareas*\n"
-                "• *Completa [tarea]*\n• *Elimina [tarea]*",
-                parse_mode="Markdown"
-            )
-
-    except Exception as e:
-        await update.message.reply_text(f"Ocurrió un error: {str(e)}")
-
-# ── main ──────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    token = os.environ["TELEGRAM_TOKEN"]
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot corriendo...")
-    app.run_polling()
